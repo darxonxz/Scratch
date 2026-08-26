@@ -19,17 +19,72 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# --- 2. MEMORY INITIALIZATION ---
+# --- 2. STATE INITIALIZATION ---
 if 'tasks' not in st.session_state:
     st.session_state.tasks = []
+if 'feedback_msg' not in st.session_state:
+    st.session_state.feedback_msg = None
 
-# Initialize input state variables so they don't crash on first load
 if 'q_title' not in st.session_state: st.session_state.q_title = ""
 if 'q_cat' not in st.session_state: st.session_state.q_cat = ""
 if 'q_subs' not in st.session_state: st.session_state.q_subs = ""
 if 'paste_area' not in st.session_state: st.session_state.paste_area = ""
 
-# --- 3. CALLBACK FUNCTIONS (THE FIX) ---
+# --- 3. EXTRACTION ENGINE (WITH SMART FALLBACK) ---
+def extract_tasks_from_text(raw_text, source_name="Imported"):
+    if not raw_text or not raw_text.strip():
+        st.session_state.feedback_msg = ("warning", "No readable text found!")
+        return
+
+    lines = [line.strip() for line in raw_text.split('\n') if line.strip()]
+    new_tasks = []
+    current_cat = source_name
+
+    # Step A: Attempt Strict Parsing (Bullets, Numbers, Keywords)
+    for line in lines:
+        is_bullet = re.match(r'^(?:[-*•▪►]|\d+[\.\)]|\(?\d+\))\s', line)
+        is_keyword = re.match(r'^(?:task|to do|todo|action|item|q\d+|question)[\s:]', line, re.IGNORECASE)
+
+        if is_bullet or is_keyword:
+            clean = re.sub(r'^(?:[-*•▪►]|\d+[\.\)]|\(?\d+\))\s*', '', line)
+            clean = re.sub(r'^(?:task|to do|todo|action|item|q\d+|question)[\s:]*', '', clean, flags=re.IGNORECASE).strip()
+
+            if clean:
+                low = clean.lower()
+                prio = "P1 (High)" if any(w in low for w in ['urgent', 'asap', 'critical']) else ("P2 (Medium)" if any(w in low for w in ['medium', 'important']) else "P3 (Low)")
+                new_tasks.append({
+                    "id": str(uuid.uuid4()),
+                    "text": clean,
+                    "category": current_cat,
+                    "priority": prio,
+                    "completed": False,
+                    "subtasks": []
+                })
+        elif 2 < len(line) < 35 and not line.endswith('.'):
+            current_cat = line.strip().strip(':')
+
+    # Step B: Smart Fallback (If 0 strict tasks were found, treat all non-empty lines as tasks)
+    if not new_tasks:
+        for line in lines:
+            if len(line) > 2:
+                low = line.lower()
+                prio = "P1 (High)" if any(w in low for w in ['urgent', 'asap', 'critical']) else ("P2 (Medium)" if any(w in low for w in ['medium', 'important']) else "P3 (Low)")
+                new_tasks.append({
+                    "id": str(uuid.uuid4()),
+                    "text": line,
+                    "category": source_name,
+                    "priority": prio,
+                    "completed": False,
+                    "subtasks": []
+                })
+
+    if new_tasks:
+        st.session_state.tasks.extend(new_tasks)
+        st.session_state.feedback_msg = ("success", f"Extracted {len(new_tasks)} tasks successfully! 🎉")
+    else:
+        st.session_state.feedback_msg = ("warning", "Could not extract tasks from document.")
+
+# --- 4. CALLBACK FUNCTIONS ---
 def add_quick_task():
     title = st.session_state.q_title
     if title.strip():
@@ -44,61 +99,37 @@ def add_quick_task():
             "completed": False,
             "subtasks": subs
         })
-        # Reset input boxes
         st.session_state.q_title = ""
         st.session_state.q_cat = ""
         st.session_state.q_subs = ""
-
-def extract_from_text(text):
-    if not text.strip(): return
-    lines = text.split('\n')
-    current_cat = "Imported"
-    
-    for line in lines:
-        line = line.strip()
-        if not line: continue
-            
-        is_bullet = re.match(r'^(?:[-*•]|\d+[\.\)])\s', line)
-        is_keyword = re.match(r'^(?:task|to do|todo|action|item)[\s:]', line, re.IGNORECASE)
-        
-        if is_bullet or is_keyword:
-            clean_text = re.sub(r'^(?:[-*•]|\d+[\.\)])\s*', '', line)
-            clean_text = re.sub(r'^(?:task|to do|todo|action|item)[\s:]*', '', clean_text, flags=re.IGNORECASE).strip()
-            
-            if clean_text:
-                low = clean_text.lower()
-                prio = "P1 (High)" if any(w in low for w in ['urgent', 'asap', 'critical']) else ("P2 (Medium)" if any(w in low for w in ['medium', 'important']) else "P3 (Low)")
-                
-                st.session_state.tasks.append({
-                    "id": str(uuid.uuid4()), 
-                    "text": clean_text, 
-                    "category": current_cat,
-                    "priority": prio, 
-                    "completed": False, 
-                    "subtasks": []
-                })
-        elif 2 < len(line) < 40 and not line.endswith('.'):
-            current_cat = line.strip().strip(':')
+        st.session_state.feedback_msg = ("success", "Task added! 🎯")
 
 def process_pdf():
     if st.session_state.pdf_uploader is not None:
-        pdf_bytes = st.session_state.pdf_uploader.getvalue()
-        text = ""
-        with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
-            for page in pdf.pages:
-                extracted = page.extract_text()
-                if extracted: text += extracted + "\n"
-        extract_from_text(text)
+        try:
+            pdf_bytes = st.session_state.pdf_uploader.getvalue()
+            text = ""
+            with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+                for page in pdf.pages:
+                    extracted = page.extract_text()
+                    if extracted:
+                        text += extracted + "\n"
+            extract_tasks_from_text(text, source_name="PDF Import")
+        except Exception as e:
+            st.session_state.feedback_msg = ("error", f"PDF Read Error: {e}")
+    else:
+        st.session_state.feedback_msg = ("warning", "Please upload a PDF file first!")
 
 def process_paste():
     if st.session_state.paste_area:
-        extract_from_text(st.session_state.paste_area)
+        extract_tasks_from_text(st.session_state.paste_area, source_name="Pasted Notes")
         st.session_state.paste_area = ""
 
 def clear_all_tasks():
     st.session_state.tasks = []
+    st.session_state.feedback_msg = ("info", "All tasks cleared.")
 
-# --- 4. SIDEBAR: TIMER & EXPORT ---
+# --- 5. SIDEBAR: TIMER & EXPORT ---
 with st.sidebar:
     st.header("⚡ Focus Zone")
     timer_mins = st.number_input("Focus duration (mins)", min_value=1, max_value=60, value=25)
@@ -115,7 +146,6 @@ with st.sidebar:
     st.divider()
     st.header("💾 Export Data")
     if st.session_state.tasks:
-        # Create a clean DataFrame for export
         export_df = pd.DataFrame([{
             "Task Title": t.get("text", ""),
             "Category": t.get("category", ""),
@@ -133,8 +163,16 @@ with st.sidebar:
     st.divider()
     st.button("🗑️ Clear All Tasks", on_click=clear_all_tasks, type="secondary")
 
-# --- 5. HEADER ---
+# --- 6. HEADER & METRICS ---
 st.title("⚡ TaskFlow Pro")
+
+if st.session_state.feedback_msg:
+    msg_type, msg_txt = st.session_state.feedback_msg
+    if msg_type == "success": st.success(msg_txt)
+    elif msg_type == "warning": st.warning(msg_txt)
+    elif msg_type == "error": st.error(msg_txt)
+    elif msg_type == "info": st.info(msg_txt)
+    st.session_state.feedback_msg = None
 
 if st.session_state.tasks:
     total_count = len(st.session_state.tasks)
@@ -150,7 +188,7 @@ if st.session_state.tasks:
 
 st.divider()
 
-# --- 6. INPUT HUB ---
+# --- 7. INPUT HUB ---
 with st.expander("➕ Import / Add Tasks", expanded=not bool(st.session_state.tasks)):
     input_tab1, input_tab2, input_tab3 = st.tabs(["Quick Add", "📄 Upload PDF", "📋 Paste Notes"])
     
@@ -173,7 +211,7 @@ with st.expander("➕ Import / Add Tasks", expanded=not bool(st.session_state.ta
         st.text_area("Paste text or bullet points here:", height=150, key="paste_area")
         st.button("Extract Pasted Tasks 🚀", on_click=process_paste)
 
-# --- 7. WORKSPACE MODES ---
+# --- 8. WORKSPACE MODES ---
 if st.session_state.tasks:
     checklist_mode, organizer_mode = st.tabs(["🎯 Focus Checklist Mode", "🛠️ Bulk Organizer Mode"])
 
@@ -188,7 +226,6 @@ if st.session_state.tasks:
         with c3:
             sel_prios = st.multiselect("Priority Slicer", ["P1 (High)", "P2 (Medium)", "P3 (Low)"], default=["P1 (High)", "P2 (Medium)", "P3 (Low)"])
 
-        # Filter Logic
         filtered_tasks = [
             t for t in st.session_state.tasks
             if (search_str in t.get('text', '').lower() or search_str in t.get('category', '').lower())
@@ -234,7 +271,7 @@ if st.session_state.tasks:
 
     # --- BULK ORGANIZER MODE ---
     with organizer_mode:
-        st.info("💡 **Bulk Edit Mode:** Double-click any cell to edit titles, categories, or priorities. The main list updates automatically.")
+        st.info("💡 **Bulk Edit Mode:** Double-click any cell to edit titles, categories, or priorities.")
         
         df_editor = pd.DataFrame(st.session_state.tasks)
         
@@ -254,7 +291,6 @@ if st.session_state.tasks:
             key="spreadsheet_editor"
         )
         
-        # Save back to session state on button click
         if st.button("💾 Apply Bulk Changes", type="primary"):
             updated_tasks = []
             for _, row in edited_grid.iterrows():
@@ -270,6 +306,5 @@ if st.session_state.tasks:
                 })
             
             st.session_state.tasks = updated_tasks
-            st.success("Changes saved successfully! 🎉")
-            time.sleep(0.5)
+            st.session_state.feedback_msg = ("success", "Bulk changes saved! 🎉")
             st.rerun()
